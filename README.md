@@ -37,19 +37,30 @@ direct Ceph daemons inside it:
 The default image is `quay.io/ceph/ceph:v19`. Override it with `--image` to
 test a specific Ceph release; see [Supported Ceph Versions](#supported-ceph-versions).
 
+## Install
+
+Pick one:
+
+```sh
+# Prebuilt binary from the latest release
+curl -L -o cephplayground \
+  https://github.com/dniminenn/cephplayground/releases/latest/download/cephplayground-linux-amd64
+sudo install -m 0755 cephplayground /usr/local/bin/cephplayground
+
+# Or via go install
+go install github.com/dniminenn/cephplayground/cmd/cephplayground@latest
+
+# Or build from source
+make && sudo install -m 0755 bin/cephplayground /usr/local/bin/cephplayground
+```
+
+Verify:
+
+```sh
+cephplayground version
+```
+
 ## Quick Start
-
-Build the binary:
-
-```sh
-make
-```
-
-Install it somewhere on `PATH`:
-
-```sh
-sudo install -m 0755 bin/cephplayground /usr/local/bin/cephplayground
-```
 
 Check the host first:
 
@@ -68,6 +79,14 @@ Pick a subset with `--services`:
 ```sh
 sudo cephplayground launch --services rgw
 sudo cephplayground launch --services cephfs,rbd
+```
+
+Pick a Ceph release with `--ceph` (tag or codename):
+
+```sh
+sudo cephplayground launch --ceph reef       # quay.io/ceph/ceph:v18
+sudo cephplayground launch --ceph v20        # quay.io/ceph/ceph:v20
+sudo cephplayground launch --ceph v18.2.4    # specific minor
 ```
 
 `launch` prints the endpoint and the full set of client variables. Export
@@ -94,6 +113,7 @@ env             Print client environment variables
 shell           Open a shell in the playground container
 logs            Follow container logs
 doctor          Check host prerequisites
+version         Print the binary version
 ```
 
 ## Defaults

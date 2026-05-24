@@ -1,11 +1,7 @@
 package main
 
-import (
-	"os"
-
-	"github.com/dniminenn/cephplayground/internal/adm"
-)
+import "github.com/dniminenn/cephplayground/cmd/cephplayground/cmd"
 
 func main() {
-	os.Exit(adm.Main(os.Args[1:], os.Stdout, os.Stderr))
+	cmd.Execute()
 }

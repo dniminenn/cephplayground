@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,21 +36,59 @@ const (
 	rbdSampleImage    = "play"
 	rbdClientName     = "cephplay-rbd"
 	cephConfFile      = "ceph.conf"
-	adminKeyringFile  = "ceph.client.admin.keyring"
+	adminKeyringFile = "ceph.client.admin.keyring"
 	cephFSKeyringFile = "ceph.client.cephplay-fs.keyring"
 	rbdKeyringFile    = "ceph.client.cephplay-rbd.keyring"
 )
 
+// Exported service identifiers.
+const (
+	ServiceRGW    = serviceRGW
+	ServiceCephFS = serviceCephFS
+	ServiceRBD    = serviceRBD
+)
+
+// AppName is the binary / project name.
+const AppName = appName
+
+// DefaultName is the default playground name.
+const DefaultName = defaultName
+
 var defaultServices = []string{serviceRGW, serviceCephFS, serviceRBD}
+
+// DefaultServices returns a fresh copy of the default service list.
+func DefaultServices() []string {
+	svcs := make([]string, len(defaultServices))
+	copy(svcs, defaultServices)
+	return svcs
+}
+
+// Version is set via -ldflags at build time. Defaults to "dev" for local builds.
+var Version = "dev"
+
+var cephCodenames = map[string]string{
+	"pacific":  "v16",
+	"quincy":   "v17",
+	"reef":     "v18",
+	"squid":    "v19",
+	"tentacle": "v20",
+}
+
+func resolveCephImage(value string) string {
+	v := strings.ToLower(strings.TrimSpace(value))
+	if tag, ok := cephCodenames[v]; ok {
+		v = tag
+	}
+	return "quay.io/ceph/ceph:" + v
+}
+
+// ResolveCephImage maps a tag or codename to a full quay.io image.
+func ResolveCephImage(value string) string { return resolveCephImage(value) }
 
 //go:embed assets/*
 var assets embed.FS
 
-type CLI struct {
-	out io.Writer
-	err io.Writer
-}
-
+// Config is the launch-time configuration. Callers populate it from CLI flags.
 type Config struct {
 	Name            string
 	StateDir        string
@@ -71,6 +108,7 @@ type Config struct {
 	DryRun          bool
 }
 
+// State is the persisted record of a running playground.
 type State struct {
 	Version         int       `json:"version"`
 	Name            string    `json:"name"`
@@ -103,6 +141,7 @@ type State struct {
 	CreatedAt       time.Time `json:"created_at"`
 }
 
+// HasService reports whether name is in the state's service list.
 func (s State) HasService(name string) bool {
 	for _, svc := range s.Services {
 		if svc == name {
@@ -112,76 +151,18 @@ func (s State) HasService(name string) bool {
 	return false
 }
 
+// Runner wraps exec.Command for dry-run support.
 type Runner struct {
 	Out    io.Writer
 	Err    io.Writer
 	DryRun bool
 }
 
-func Main(args []string, out, err io.Writer) int {
-	c := &CLI{out: out, err: err}
-	if len(args) == 0 {
-		c.usage()
-		return 2
-	}
-
-	var runErr error
-	switch args[0] {
-	case "launch", "up":
-		runErr = c.launch(args[1:])
-	case "destroy", "down":
-		runErr = c.destroy(args[1:])
-	case "reset":
-		runErr = c.reset(args[1:])
-	case "status":
-		runErr = c.status(args[1:])
-	case "env":
-		runErr = c.env(args[1:])
-	case "shell":
-		runErr = c.shell(args[1:])
-	case "logs":
-		runErr = c.logs(args[1:])
-	case "doctor":
-		runErr = c.doctor(args[1:])
-	case "help", "-h", "--help":
-		c.usage()
-		return 0
-	default:
-		fmt.Fprintf(err, "unknown command %q\n\n", args[0])
-		c.usage()
-		return 2
-	}
-	if runErr != nil {
-		fmt.Fprintf(err, "error: %v\n", runErr)
-		return 1
-	}
-	return 0
-}
-
-func (c *CLI) usage() {
-	fmt.Fprintf(c.out, `%s runs a disposable, tmpfs-backed Ceph RGW playground.
-
-Usage:
-  %s <command> [flags]
-
-Commands:
-  launch          Create and start the playground
-  destroy         Stop and remove the playground state
-  reset           Destroy then launch again
-  status          Show state and probe the RGW endpoint
-  env             Print AWS-compatible environment variables
-  shell           Open a shell in the playground container
-  logs            Follow container logs
-  doctor          Check host prerequisites
-
-Most commands accept --name and --state-dir. Defaults use /tmp/%s/<name>.
-`, appName, appName, appName)
-}
+// DefaultConfig returns a fully-populated Config with safe defaults.
+func DefaultConfig(name string) Config { return defaultConfig(name) }
 
 func defaultConfig(name string) Config {
 	base := filepath.Join(os.TempDir(), appName, name)
-	svcs := make([]string, len(defaultServices))
-	copy(svcs, defaultServices)
 	return Config{
 		Name:            name,
 		StateDir:        base,
@@ -196,101 +177,228 @@ func defaultConfig(name string) Config {
 		AccessKey:       "play",
 		SecretKey:       "playsecret",
 		S3UID:           "play",
-		Services:        svcs,
+		Services:        DefaultServices(),
 	}
 }
 
-func addCommonFlags(fs *flag.FlagSet, cfg *Config) {
-	fs.StringVar(&cfg.Name, "name", cfg.Name, "playground name")
-	fs.StringVar(&cfg.StateDir, "state-dir", cfg.StateDir, "state directory")
+// NormalizeConfig fixes up derived fields after flag parsing.
+func NormalizeConfig(cfg *Config) { normalizeConfig(cfg) }
+
+func normalizeConfig(cfg *Config) {
+	if cfg.Name == "" {
+		cfg.Name = defaultName
+	}
+	defaultBase := filepath.Join(os.TempDir(), appName, defaultName)
+	if cfg.StateDir == "" || (cfg.StateDir == defaultBase && cfg.Name != defaultName) {
+		cfg.StateDir = filepath.Join(os.TempDir(), appName, cfg.Name)
+	}
+	cfg.StateDir = filepath.Clean(cfg.StateDir)
+	cfg.ContainerName = "cephplay-" + sanitizeName(cfg.Name)
+	cfg.OSDImage = filepath.Join(cfg.StateDir, "osd0.img")
 }
 
-func (c *CLI) launch(args []string) error {
-	cfg := defaultConfig(defaultName)
-	size := "16GiB"
-	mem := "1GiB"
-	services := strings.Join(cfg.Services, ",")
-	fs := flag.NewFlagSet("launch", flag.ContinueOnError)
-	fs.SetOutput(c.err)
-	addCommonFlags(fs, &cfg)
-	fs.StringVar(&cfg.Runtime, "runtime", cfg.Runtime, "auto, docker, or podman")
-	fs.StringVar(&cfg.Image, "image", cfg.Image, "Ceph container image")
-	fs.StringVar(&size, "osd-size", size, "tmpfs-backed OSD image size")
-	fs.StringVar(&mem, "osd-memory-target", mem, "Ceph osd_memory_target")
-	fs.IntVar(&cfg.RGWPort, "rgw-port", cfg.RGWPort, "host port for RGW (forwarded or bound directly in host-network mode)")
-	fs.StringVar(&cfg.Region, "region", cfg.Region, "S3 region to advertise to clients")
-	fs.StringVar(&cfg.AccessKey, "access-key", cfg.AccessKey, "S3 access key")
-	fs.StringVar(&cfg.SecretKey, "secret-key", cfg.SecretKey, "S3 secret key")
-	fs.StringVar(&cfg.S3UID, "uid", cfg.S3UID, "RGW user id")
-	fs.StringVar(&services, "services", services, "comma-separated subset of rgw,cephfs,rbd")
-	fs.BoolVar(&cfg.Privileged, "privileged", false, "run container privileged instead of passing only the OSD loop device")
-	fs.BoolVar(&cfg.DryRun, "dry-run", false, "print commands without executing")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
+// Launch creates and starts the playground. It blocks until the cluster is
+// ready (or returns an error / dry-run completes).
+func Launch(out, errW io.Writer, cfg Config) (State, error) {
 	normalizeConfig(&cfg)
-
-	parsedServices, err := parseServices(services)
-	if err != nil {
-		return err
-	}
-	cfg.Services = parsedServices
-
-	cfg.OSDSizeBytes, err = parseSize(size)
-	if err != nil {
-		return fmt.Errorf("invalid --osd-size: %w", err)
-	}
-	cfg.OSDMemoryTarget, err = parseSize(mem)
-	if err != nil {
-		return fmt.Errorf("invalid --osd-memory-target: %w", err)
-	}
 	if cfg.RGWPort <= 0 || cfg.RGWPort > 65535 {
-		return fmt.Errorf("invalid --rgw-port %d", cfg.RGWPort)
+		return State{}, fmt.Errorf("invalid --rgw-port %d", cfg.RGWPort)
 	}
 	if cfg.AccessKey == "" || cfg.SecretKey == "" || cfg.S3UID == "" {
-		return errors.New("access key, secret key, and uid must be non-empty")
+		return State{}, errors.New("access key, secret key, and uid must be non-empty")
 	}
 	if cfg.Region == "" {
-		return errors.New("region must be non-empty")
+		return State{}, errors.New("region must be non-empty")
 	}
-
-	runtimeName, err := resolveRuntime(cfg.Runtime)
+	rt, err := resolveRuntime(cfg.Runtime)
 	if err != nil {
-		return err
+		return State{}, err
 	}
-	cfg.Runtime = runtimeName
-
+	cfg.Runtime = rt
 	if !cfg.DryRun && os.Geteuid() != 0 {
-		return errors.New("launch must run as root because it creates a loop device")
+		return State{}, errors.New("launch must run as root because it creates a loop device")
 	}
-
-	r := &Runner{Out: c.out, Err: c.err, DryRun: cfg.DryRun}
+	r := &Runner{Out: out, Err: errW, DryRun: cfg.DryRun}
 	if err := ensureStateDir(cfg.StateDir, cfg.DryRun); err != nil {
-		return err
+		return State{}, err
 	}
 	if err := writeMarker(cfg.StateDir, cfg.DryRun); err != nil {
-		return err
+		return State{}, err
 	}
 	if !cfg.DryRun && exists(filepath.Join(cfg.StateDir, "state.json")) {
-		return fmt.Errorf("%s already has playground state; use status, reset, or destroy", cfg.StateDir)
+		return State{}, fmt.Errorf("%s already has playground state; use status, reset, or destroy", cfg.StateDir)
 	}
 	if err := installContainerAssets(cfg.StateDir, cfg.DryRun); err != nil {
-		return err
+		return State{}, err
 	}
 	fsid := randomUUIDLike()
 	hostNetwork := needsHostNetwork(cfg.Services)
 	if err := writeGuestConfig(cfg, fsid, hostNetwork, cfg.DryRun); err != nil {
-		return err
+		return State{}, err
 	}
 	if err := ensureOSDImage(cfg.OSDImage, cfg.OSDSizeBytes, cfg.DryRun); err != nil {
-		return err
+		return State{}, err
 	}
 
 	loop, err := attachLoop(context.Background(), r, cfg.OSDImage)
 	if err != nil {
-		return err
+		return State{}, err
 	}
 
+	st := newState(cfg, fsid, hostNetwork, loop)
+	if err := saveState(cfg.StateDir, st, cfg.DryRun); err != nil {
+		_ = r.Run(context.Background(), "losetup", "-d", loop)
+		return State{}, err
+	}
+	if err := runContainer(context.Background(), r, cfg, loop); err != nil {
+		_ = r.Run(context.Background(), "losetup", "-d", loop)
+		if !cfg.DryRun {
+			_ = os.Remove(filepath.Join(cfg.StateDir, "state.json"))
+		}
+		return State{}, err
+	}
+	if cfg.DryRun {
+		return st, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	probe := ""
+	if st.HasService(serviceRGW) {
+		probe = st.Endpoint
+	}
+	if err := waitForReady(ctx, filepath.Join(cfg.StateDir, "ready"), probe); err != nil {
+		return st, fmt.Errorf("%w; inspect with `%s logs --name %s` or clean up with `%s destroy --name %s`", err, appName, cfg.Name, appName, cfg.Name)
+	}
+	return st, nil
+}
+
+// Destroy stops the container, detaches the loop device, and removes the
+// state directory (subject to the marker check).
+func Destroy(out, errW io.Writer, cfg Config, dryRun bool) error {
+	normalizeConfig(&cfg)
+	if !dryRun && os.Geteuid() != 0 {
+		return errors.New("destroy must run as root because it detaches the playground loop device")
+	}
+	if err := requireMarker(cfg.StateDir); err != nil {
+		return err
+	}
+	st, _ := loadState(cfg.StateDir)
+	if st.ContainerName == "" {
+		st.ContainerName = cfg.ContainerName
+	}
+	if st.Runtime == "" {
+		if rt, err := resolveRuntime(cfg.Runtime); err == nil {
+			st.Runtime = rt
+		}
+	}
+	if st.OSDImage == "" {
+		st.OSDImage = cfg.OSDImage
+	}
+	r := &Runner{Out: out, Err: errW, DryRun: dryRun}
+	if st.Runtime != "" {
+		_ = r.Run(context.Background(), st.Runtime, "stop", "--timeout", "30", st.ContainerName)
+		_ = r.Run(context.Background(), st.Runtime, "rm", "-f", st.ContainerName)
+	}
+	if st.LoopDevice != "" {
+		_ = r.Run(context.Background(), "losetup", "-d", st.LoopDevice)
+	}
+	if loops, err := loopDevicesFor(context.Background(), r, st.OSDImage); err == nil {
+		for _, loop := range loops {
+			_ = r.Run(context.Background(), "losetup", "-d", loop)
+		}
+	}
+	if dryRun {
+		return nil
+	}
+	return os.RemoveAll(cfg.StateDir)
+}
+
+// LoadState loads the persisted state for the playground at cfg's state dir.
+func LoadState(cfg Config) (State, error) {
+	normalizeConfig(&cfg)
+	return loadState(cfg.StateDir)
+}
+
+// ProbeRGW makes a short HTTP GET against the endpoint and returns the status.
+func ProbeRGW(endpoint string) (string, error) {
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(endpoint)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	return resp.Status, nil
+}
+
+// PrintEnv writes the shell export block for the given state.
+func PrintEnv(out io.Writer, st State) { printEnv(out, st) }
+
+// ContainerShell returns an *exec.Cmd that opens a bash inside the container.
+func ContainerShell(st State) *exec.Cmd {
+	return exec.Command(st.Runtime, "exec", "-it", st.ContainerName, "bash")
+}
+
+// ContainerLogs returns an *exec.Cmd that prints the container's logs.
+func ContainerLogs(st State, follow bool) *exec.Cmd {
+	args := []string{"logs"}
+	if follow {
+		args = append(args, "-f")
+	}
+	args = append(args, st.ContainerName)
+	return exec.Command(st.Runtime, args...)
+}
+
+// DoctorCheck is a single host-prerequisite check result.
+type DoctorCheck struct {
+	Name   string
+	Status string // "ok" | "missing" | "warn"
+	Detail string
+}
+
+// Doctor runs host prerequisite checks.
+func Doctor() []DoctorCheck {
+	out := []DoctorCheck{
+		{Name: "os", Status: "ok", Detail: fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH)},
+		{Name: "uid", Status: "ok", Detail: fmt.Sprintf("%d", os.Geteuid())},
+	}
+	if path, err := exec.LookPath("losetup"); err == nil {
+		out = append(out, DoctorCheck{Name: "losetup", Status: "ok", Detail: path})
+	} else {
+		out = append(out, DoctorCheck{Name: "losetup", Status: "missing", Detail: "required"})
+	}
+	if path, err := exec.LookPath("docker"); err == nil {
+		out = append(out, DoctorCheck{Name: "docker", Status: "ok", Detail: path})
+	} else {
+		out = append(out, DoctorCheck{Name: "docker", Status: "warn", Detail: "needed unless podman is available"})
+	}
+	if path, err := exec.LookPath("podman"); err == nil {
+		out = append(out, DoctorCheck{Name: "podman", Status: "ok", Detail: path})
+	} else {
+		out = append(out, DoctorCheck{Name: "podman", Status: "warn", Detail: "needed unless docker is available"})
+	}
+	tmp := os.TempDir()
+	if isTmpfs(tmp) {
+		out = append(out, DoctorCheck{Name: "tmpfs", Status: "ok", Detail: tmp})
+	} else {
+		out = append(out, DoctorCheck{Name: "tmpfs", Status: "warn", Detail: fmt.Sprintf("%s is not tmpfs; use --state-dir on tmpfs if SSD avoidance matters", tmp)})
+	}
+	return out
+}
+
+// ParseServices validates and normalizes a comma-separated services list.
+func ParseServices(raw string) ([]string, error) { return parseServices(raw) }
+
+// ParseSize parses sizes like "16GiB", "1MB", "1024".
+func ParseSize(s string) (int64, error) { return parseSize(s) }
+
+// FormatSize is the inverse of ParseSize for round GiB sizes.
+func FormatSize(n int64) string { return formatSize(n) }
+
+// IsMissingStateErr reports whether the error is the "no marker" case from Destroy.
+func IsMissingStateErr(err error) bool { return isMissingStateErr(err) }
+
+func newState(cfg Config, fsid string, hostNetwork bool, loop string) State {
 	st := State{
 		Version:         stateVersion,
 		Name:            cfg.Name,
@@ -326,260 +434,7 @@ func (c *CLI) launch(args []string) error {
 		st.RBDClient = rbdClientName
 		st.RBDKeyring = filepath.Join(cfg.StateDir, rbdKeyringFile)
 	}
-	if err := saveState(cfg.StateDir, st, cfg.DryRun); err != nil {
-		_ = r.Run(context.Background(), "losetup", "-d", loop)
-		return err
-	}
-	if err := runContainer(context.Background(), r, cfg, loop); err != nil {
-		_ = r.Run(context.Background(), "losetup", "-d", loop)
-		if !cfg.DryRun {
-			_ = os.Remove(filepath.Join(cfg.StateDir, "state.json"))
-		}
-		return err
-	}
-	if cfg.DryRun {
-		fmt.Fprintf(c.out, "dry run complete for %s\nendpoint would be: %s\n", cfg.ContainerName, st.Endpoint)
-		return nil
-	}
-
-	probeEndpoint := ""
-	if st.HasService(serviceRGW) {
-		probeEndpoint = st.Endpoint
-		fmt.Fprintf(c.out, "waiting for RGW at %s\n", st.Endpoint)
-	} else {
-		fmt.Fprintf(c.out, "waiting for cluster\n")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	if err := waitForReady(ctx, filepath.Join(cfg.StateDir, "ready"), probeEndpoint); err != nil {
-		return fmt.Errorf("%w; inspect with `%s logs --name %s` or clean up with `%s destroy --name %s`", err, appName, cfg.Name, appName, cfg.Name)
-	}
-
-	fmt.Fprintf(c.out, "ready %s\nservices: %s\n", cfg.ContainerName, strings.Join(st.Services, ","))
-	if st.HasService(serviceRGW) {
-		fmt.Fprintf(c.out, "endpoint: %s\n", st.Endpoint)
-	}
-	fmt.Fprintln(c.out)
-	printEnv(c.out, st)
-	fmt.Fprintf(c.out, "\nrun `%s env --name %s` to print these variables again\n", appName, cfg.Name)
-	return nil
-}
-
-func (c *CLI) destroy(args []string) error {
-	cfg := defaultConfig(defaultName)
-	dryRun := false
-	fs := flag.NewFlagSet("destroy", flag.ContinueOnError)
-	fs.SetOutput(c.err)
-	addCommonFlags(fs, &cfg)
-	fs.BoolVar(&dryRun, "dry-run", false, "print commands without executing")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	normalizeConfig(&cfg)
-	if !dryRun && os.Geteuid() != 0 {
-		return errors.New("destroy must run as root because it detaches the playground loop device")
-	}
-	if err := requireMarker(cfg.StateDir); err != nil {
-		return err
-	}
-
-	st, _ := loadState(cfg.StateDir)
-	if st.ContainerName == "" {
-		st.ContainerName = cfg.ContainerName
-	}
-	if st.Runtime == "" {
-		if runtimeName, err := resolveRuntime(cfg.Runtime); err == nil {
-			st.Runtime = runtimeName
-		}
-	}
-	if st.OSDImage == "" {
-		st.OSDImage = cfg.OSDImage
-	}
-
-	r := &Runner{Out: c.out, Err: c.err, DryRun: dryRun}
-	if st.Runtime != "" {
-		_ = r.Run(context.Background(), st.Runtime, "stop", "--timeout", "30", st.ContainerName)
-		_ = r.Run(context.Background(), st.Runtime, "rm", "-f", st.ContainerName)
-	}
-	if st.LoopDevice != "" {
-		_ = r.Run(context.Background(), "losetup", "-d", st.LoopDevice)
-	}
-	if loops, err := loopDevicesFor(context.Background(), r, st.OSDImage); err == nil {
-		for _, loop := range loops {
-			_ = r.Run(context.Background(), "losetup", "-d", loop)
-		}
-	}
-	if dryRun {
-		fmt.Fprintf(c.out, "would remove %s\n", cfg.StateDir)
-		return nil
-	}
-	if err := os.RemoveAll(cfg.StateDir); err != nil {
-		return err
-	}
-	fmt.Fprintf(c.out, "removed %s\n", cfg.StateDir)
-	return nil
-}
-
-func (c *CLI) reset(args []string) error {
-	destroyArgs := resetDestroyArgs(args)
-	if err := c.destroy(destroyArgs); err != nil && !isMissingStateErr(err) {
-		fmt.Fprintf(c.err, "reset destroy phase: %v\n", err)
-	}
-	return c.launch(args)
-}
-
-func (c *CLI) status(args []string) error {
-	cfg := defaultConfig(defaultName)
-	fs := flag.NewFlagSet("status", flag.ContinueOnError)
-	fs.SetOutput(c.err)
-	addCommonFlags(fs, &cfg)
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	normalizeConfig(&cfg)
-
-	st, err := loadState(cfg.StateDir)
-	if err != nil {
-		return err
-	}
-	services := strings.Join(st.Services, ",")
-	if services == "" {
-		services = serviceRGW
-	}
-	fmt.Fprintf(c.out, "name: %s\nstate: %s\ncontainer: %s\nruntime: %s\nimage: %s\nservices: %s\nosd image: %s (%s)\n",
-		st.Name, st.StateDir, st.ContainerName, st.Runtime, st.Image, services, st.OSDImage, formatSize(st.OSDSizeBytes))
-	if st.LoopDevice != "" {
-		fmt.Fprintf(c.out, "loop: %s\n", st.LoopDevice)
-	}
-	if st.HasService(serviceRGW) {
-		fmt.Fprintf(c.out, "endpoint: %s\n", st.Endpoint)
-	}
-
-	if !st.HasService(serviceRGW) {
-		return nil
-	}
-	client := http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(st.Endpoint)
-	if err != nil {
-		fmt.Fprintf(c.out, "rgw probe: failed: %v\n", err)
-		return nil
-	}
-	defer resp.Body.Close()
-	fmt.Fprintf(c.out, "rgw probe: HTTP %s\n", resp.Status)
-	return nil
-}
-
-func (c *CLI) env(args []string) error {
-	cfg := defaultConfig(defaultName)
-	fs := flag.NewFlagSet("env", flag.ContinueOnError)
-	fs.SetOutput(c.err)
-	addCommonFlags(fs, &cfg)
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	normalizeConfig(&cfg)
-
-	st, err := loadState(cfg.StateDir)
-	if err != nil {
-		return err
-	}
-	printEnv(c.out, st)
-	return nil
-}
-
-func (c *CLI) shell(args []string) error {
-	cfg := defaultConfig(defaultName)
-	fs := flag.NewFlagSet("shell", flag.ContinueOnError)
-	fs.SetOutput(c.err)
-	addCommonFlags(fs, &cfg)
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	normalizeConfig(&cfg)
-	st, err := loadState(cfg.StateDir)
-	if err != nil {
-		return err
-	}
-	cmd := exec.Command(st.Runtime, "exec", "-it", st.ContainerName, "bash")
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = c.out
-	cmd.Stderr = c.err
-	return cmd.Run()
-}
-
-func (c *CLI) logs(args []string) error {
-	cfg := defaultConfig(defaultName)
-	follow := true
-	fs := flag.NewFlagSet("logs", flag.ContinueOnError)
-	fs.SetOutput(c.err)
-	addCommonFlags(fs, &cfg)
-	fs.BoolVar(&follow, "f", follow, "follow logs")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	normalizeConfig(&cfg)
-	st, err := loadState(cfg.StateDir)
-	if err != nil {
-		return err
-	}
-	largs := []string{"logs"}
-	if follow {
-		largs = append(largs, "-f")
-	}
-	largs = append(largs, st.ContainerName)
-	cmd := exec.Command(st.Runtime, largs...)
-	cmd.Stdout = c.out
-	cmd.Stderr = c.err
-	return cmd.Run()
-}
-
-func (c *CLI) doctor(args []string) error {
-	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
-	fs.SetOutput(c.err)
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	fmt.Fprintf(c.out, "os: %s/%s\n", runtime.GOOS, runtime.GOARCH)
-	fmt.Fprintf(c.out, "uid: %d\n", os.Geteuid())
-
-	for _, name := range []string{"losetup"} {
-		if path, err := exec.LookPath(name); err == nil {
-			fmt.Fprintf(c.out, "ok: %s -> %s\n", name, path)
-		} else {
-			fmt.Fprintf(c.out, "missing: %s\n", name)
-		}
-	}
-	if path, err := exec.LookPath("docker"); err == nil {
-		fmt.Fprintf(c.out, "ok: docker -> %s\n", path)
-	} else {
-		fmt.Fprintf(c.out, "optional missing: docker (needed unless podman is available)\n")
-	}
-	if path, err := exec.LookPath("podman"); err == nil {
-		fmt.Fprintf(c.out, "ok: podman -> %s\n", path)
-	} else {
-		fmt.Fprintf(c.out, "optional missing: podman (needed unless docker is available)\n")
-	}
-
-	tmp := os.TempDir()
-	if isTmpfs(tmp) {
-		fmt.Fprintf(c.out, "ok: %s appears to be tmpfs\n", tmp)
-	} else {
-		fmt.Fprintf(c.out, "warn: %s is not detected as tmpfs; use --state-dir on tmpfs if SSD avoidance matters\n", tmp)
-	}
-	return nil
-}
-
-func normalizeConfig(cfg *Config) {
-	if cfg.Name == "" {
-		cfg.Name = defaultName
-	}
-	defaultBase := filepath.Join(os.TempDir(), appName, defaultName)
-	if cfg.StateDir == "" || (cfg.StateDir == defaultBase && cfg.Name != defaultName) {
-		cfg.StateDir = filepath.Join(os.TempDir(), appName, cfg.Name)
-	}
-	cfg.StateDir = filepath.Clean(cfg.StateDir)
-	cfg.ContainerName = "cephplay-" + sanitizeName(cfg.Name)
-	cfg.OSDImage = filepath.Join(cfg.StateDir, "osd0.img")
+	return st
 }
 
 func ensureStateDir(path string, dryRun bool) error {
@@ -888,17 +743,21 @@ func waitForReady(ctx context.Context, readyPath, endpoint string) error {
 	}
 }
 
+// Run executes the command, honoring dry-run mode. Stdout is discarded so
+// noisy command output (docker container IDs, losetup details) does not leak
+// into pretty CLI output; stderr is kept for diagnostics.
 func (r *Runner) Run(ctx context.Context, name string, args ...string) error {
 	if r.DryRun {
 		fmt.Fprintf(r.Out, "would run: %s %s\n", name, strings.Join(args, " "))
 		return nil
 	}
 	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Stdout = r.Out
+	cmd.Stdout = io.Discard
 	cmd.Stderr = r.Err
 	return cmd.Run()
 }
 
+// Output captures stdout from the command.
 func (r *Runner) Output(ctx context.Context, name string, args ...string) (string, error) {
 	if r.DryRun {
 		fmt.Fprintf(r.Out, "would run: %s %s\n", name, strings.Join(args, " "))
@@ -1016,26 +875,6 @@ func shellQuote(s string) string {
 
 func shellPlain(s string) string {
 	return strings.NewReplacer("\n", "", "\r", "", "'", "", "\"", "").Replace(s)
-}
-
-func resetDestroyArgs(args []string) []string {
-	var out []string
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch {
-		case arg == "--dry-run":
-			out = append(out, arg)
-		case arg == "--name" || arg == "--state-dir":
-			out = append(out, arg)
-			if i+1 < len(args) {
-				i++
-				out = append(out, args[i])
-			}
-		case strings.HasPrefix(arg, "--name=") || strings.HasPrefix(arg, "--state-dir="):
-			out = append(out, arg)
-		}
-	}
-	return out
 }
 
 func isMissingStateErr(err error) bool {

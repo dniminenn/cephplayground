@@ -66,6 +66,22 @@ func TestParseServices(t *testing.T) {
 	}
 }
 
+func TestResolveCephImage(t *testing.T) {
+	cases := map[string]string{
+		"v19":      "quay.io/ceph/ceph:v19",
+		"Reef":     "quay.io/ceph/ceph:v18",
+		"squid":    "quay.io/ceph/ceph:v19",
+		"v18.2.4":  "quay.io/ceph/ceph:v18.2.4",
+		"TENTACLE": "quay.io/ceph/ceph:v20",
+		" quincy ": "quay.io/ceph/ceph:v17",
+	}
+	for in, want := range cases {
+		if got := resolveCephImage(in); got != want {
+			t.Fatalf("resolveCephImage(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestNeedsHostNetwork(t *testing.T) {
 	if needsHostNetwork([]string{"rgw"}) {
 		t.Fatalf("rgw-only should not need host network")
@@ -75,19 +91,5 @@ func TestNeedsHostNetwork(t *testing.T) {
 	}
 	if !needsHostNetwork([]string{"rbd"}) {
 		t.Fatalf("rbd should force host network")
-	}
-}
-
-func TestResetDestroyArgsKeepsOnlyDestroyFlags(t *testing.T) {
-	got := resetDestroyArgs([]string{
-		"--name", "dev",
-		"--osd-size", "4GiB",
-		"--state-dir=/tmp/custom",
-		"--rgw-port", "9000",
-		"--dry-run",
-	})
-	want := []string{"--name", "dev", "--state-dir=/tmp/custom", "--dry-run"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("resetDestroyArgs() = %#v, want %#v", got, want)
 	}
 }
