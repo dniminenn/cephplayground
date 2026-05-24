@@ -22,11 +22,27 @@ import (
 
 const (
 	appName      = "cephplayground"
-	stateVersion = 2
+	stateVersion = 3
 	markerName   = ".cephplayground"
 	defaultName  = "rgw"
 	defaultImage = "quay.io/ceph/ceph:v19"
+
+	serviceRGW    = "rgw"
+	serviceCephFS = "cephfs"
+	serviceRBD    = "rbd"
+
+	cephFSName        = "playfs"
+	cephFSClientName  = "cephplay-fs"
+	rbdPoolName       = "rbd"
+	rbdSampleImage    = "play"
+	rbdClientName     = "cephplay-rbd"
+	cephConfFile      = "ceph.conf"
+	adminKeyringFile  = "ceph.client.admin.keyring"
+	cephFSKeyringFile = "ceph.client.cephplay-fs.keyring"
+	rbdKeyringFile    = "ceph.client.cephplay-rbd.keyring"
 )
+
+var defaultServices = []string{serviceRGW, serviceCephFS, serviceRBD}
 
 //go:embed assets/*
 var assets embed.FS
@@ -50,6 +66,7 @@ type Config struct {
 	AccessKey       string
 	SecretKey       string
 	S3UID           string
+	Services        []string
 	Privileged      bool
 	DryRun          bool
 }
@@ -70,7 +87,29 @@ type State struct {
 	Region          string    `json:"region"`
 	AccessKey       string    `json:"access_key"`
 	SecretKey       string    `json:"secret_key"`
+	Services        []string  `json:"services"`
+	HostNetwork     bool      `json:"host_network"`
+	FSID            string    `json:"fsid,omitempty"`
+	MonHost         string    `json:"mon_host,omitempty"`
+	CephConf        string    `json:"ceph_conf,omitempty"`
+	AdminKeyring    string    `json:"admin_keyring,omitempty"`
+	CephFSName      string    `json:"cephfs_name,omitempty"`
+	CephFSClient    string    `json:"cephfs_client,omitempty"`
+	CephFSKeyring   string    `json:"cephfs_keyring,omitempty"`
+	RBDPool         string    `json:"rbd_pool,omitempty"`
+	RBDImage        string    `json:"rbd_image,omitempty"`
+	RBDClient       string    `json:"rbd_client,omitempty"`
+	RBDKeyring      string    `json:"rbd_keyring,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
+}
+
+func (s State) HasService(name string) bool {
+	for _, svc := range s.Services {
+		if svc == name {
+			return true
+		}
+	}
+	return false
 }
 
 type Runner struct {
@@ -141,6 +180,8 @@ Most commands accept --name and --state-dir. Defaults use /tmp/%s/<name>.
 
 func defaultConfig(name string) Config {
 	base := filepath.Join(os.TempDir(), appName, name)
+	svcs := make([]string, len(defaultServices))
+	copy(svcs, defaultServices)
 	return Config{
 		Name:            name,
 		StateDir:        base,
@@ -155,6 +196,7 @@ func defaultConfig(name string) Config {
 		AccessKey:       "play",
 		SecretKey:       "playsecret",
 		S3UID:           "play",
+		Services:        svcs,
 	}
 }
 
@@ -167,6 +209,7 @@ func (c *CLI) launch(args []string) error {
 	cfg := defaultConfig(defaultName)
 	size := "16GiB"
 	mem := "1GiB"
+	services := strings.Join(cfg.Services, ",")
 	fs := flag.NewFlagSet("launch", flag.ContinueOnError)
 	fs.SetOutput(c.err)
 	addCommonFlags(fs, &cfg)
@@ -174,11 +217,12 @@ func (c *CLI) launch(args []string) error {
 	fs.StringVar(&cfg.Image, "image", cfg.Image, "Ceph container image")
 	fs.StringVar(&size, "osd-size", size, "tmpfs-backed OSD image size")
 	fs.StringVar(&mem, "osd-memory-target", mem, "Ceph osd_memory_target")
-	fs.IntVar(&cfg.RGWPort, "rgw-port", cfg.RGWPort, "host port forwarded to RGW")
+	fs.IntVar(&cfg.RGWPort, "rgw-port", cfg.RGWPort, "host port for RGW (forwarded or bound directly in host-network mode)")
 	fs.StringVar(&cfg.Region, "region", cfg.Region, "S3 region to advertise to clients")
 	fs.StringVar(&cfg.AccessKey, "access-key", cfg.AccessKey, "S3 access key")
 	fs.StringVar(&cfg.SecretKey, "secret-key", cfg.SecretKey, "S3 secret key")
 	fs.StringVar(&cfg.S3UID, "uid", cfg.S3UID, "RGW user id")
+	fs.StringVar(&services, "services", services, "comma-separated subset of rgw,cephfs,rbd")
 	fs.BoolVar(&cfg.Privileged, "privileged", false, "run container privileged instead of passing only the OSD loop device")
 	fs.BoolVar(&cfg.DryRun, "dry-run", false, "print commands without executing")
 	if err := fs.Parse(args); err != nil {
@@ -186,7 +230,12 @@ func (c *CLI) launch(args []string) error {
 	}
 	normalizeConfig(&cfg)
 
-	var err error
+	parsedServices, err := parseServices(services)
+	if err != nil {
+		return err
+	}
+	cfg.Services = parsedServices
+
 	cfg.OSDSizeBytes, err = parseSize(size)
 	if err != nil {
 		return fmt.Errorf("invalid --osd-size: %w", err)
@@ -228,7 +277,9 @@ func (c *CLI) launch(args []string) error {
 	if err := installContainerAssets(cfg.StateDir, cfg.DryRun); err != nil {
 		return err
 	}
-	if err := writeGuestConfig(cfg, cfg.DryRun); err != nil {
+	fsid := randomUUIDLike()
+	hostNetwork := needsHostNetwork(cfg.Services)
+	if err := writeGuestConfig(cfg, fsid, hostNetwork, cfg.DryRun); err != nil {
 		return err
 	}
 	if err := ensureOSDImage(cfg.OSDImage, cfg.OSDSizeBytes, cfg.DryRun); err != nil {
@@ -256,7 +307,24 @@ func (c *CLI) launch(args []string) error {
 		Region:          cfg.Region,
 		AccessKey:       cfg.AccessKey,
 		SecretKey:       cfg.SecretKey,
+		Services:        cfg.Services,
+		HostNetwork:     hostNetwork,
+		FSID:            fsid,
+		MonHost:         "127.0.0.1",
+		CephConf:        filepath.Join(cfg.StateDir, cephConfFile),
+		AdminKeyring:    filepath.Join(cfg.StateDir, adminKeyringFile),
 		CreatedAt:       time.Now().UTC(),
+	}
+	if containsService(cfg.Services, serviceCephFS) {
+		st.CephFSName = cephFSName
+		st.CephFSClient = cephFSClientName
+		st.CephFSKeyring = filepath.Join(cfg.StateDir, cephFSKeyringFile)
+	}
+	if containsService(cfg.Services, serviceRBD) {
+		st.RBDPool = rbdPoolName
+		st.RBDImage = rbdSampleImage
+		st.RBDClient = rbdClientName
+		st.RBDKeyring = filepath.Join(cfg.StateDir, rbdKeyringFile)
 	}
 	if err := saveState(cfg.StateDir, st, cfg.DryRun); err != nil {
 		_ = r.Run(context.Background(), "losetup", "-d", loop)
@@ -274,14 +342,23 @@ func (c *CLI) launch(args []string) error {
 		return nil
 	}
 
-	fmt.Fprintf(c.out, "waiting for RGW at %s\n", st.Endpoint)
+	probeEndpoint := ""
+	if st.HasService(serviceRGW) {
+		probeEndpoint = st.Endpoint
+		fmt.Fprintf(c.out, "waiting for RGW at %s\n", st.Endpoint)
+	} else {
+		fmt.Fprintf(c.out, "waiting for cluster\n")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	if err := waitForReady(ctx, filepath.Join(cfg.StateDir, "ready"), st.Endpoint); err != nil {
+	if err := waitForReady(ctx, filepath.Join(cfg.StateDir, "ready"), probeEndpoint); err != nil {
 		return fmt.Errorf("%w; inspect with `%s logs --name %s` or clean up with `%s destroy --name %s`", err, appName, cfg.Name, appName, cfg.Name)
 	}
 
-	fmt.Fprintf(c.out, "ready %s\nendpoint: %s\n", cfg.ContainerName, st.Endpoint)
+	fmt.Fprintf(c.out, "ready %s\nservices: %s\n", cfg.ContainerName, strings.Join(st.Services, ","))
+	if st.HasService(serviceRGW) {
+		fmt.Fprintf(c.out, "endpoint: %s\n", st.Endpoint)
+	}
 	fmt.Fprintln(c.out)
 	printEnv(c.out, st)
 	fmt.Fprintf(c.out, "\nrun `%s env --name %s` to print these variables again\n", appName, cfg.Name)
@@ -365,12 +442,22 @@ func (c *CLI) status(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(c.out, "name: %s\nstate: %s\ncontainer: %s\nruntime: %s\nimage: %s\nendpoint: %s\nosd image: %s (%s)\n",
-		st.Name, st.StateDir, st.ContainerName, st.Runtime, st.Image, st.Endpoint, st.OSDImage, formatSize(st.OSDSizeBytes))
+	services := strings.Join(st.Services, ",")
+	if services == "" {
+		services = serviceRGW
+	}
+	fmt.Fprintf(c.out, "name: %s\nstate: %s\ncontainer: %s\nruntime: %s\nimage: %s\nservices: %s\nosd image: %s (%s)\n",
+		st.Name, st.StateDir, st.ContainerName, st.Runtime, st.Image, services, st.OSDImage, formatSize(st.OSDSizeBytes))
 	if st.LoopDevice != "" {
 		fmt.Fprintf(c.out, "loop: %s\n", st.LoopDevice)
 	}
+	if st.HasService(serviceRGW) {
+		fmt.Fprintf(c.out, "endpoint: %s\n", st.Endpoint)
+	}
 
+	if !st.HasService(serviceRGW) {
+		return nil
+	}
 	client := http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get(st.Endpoint)
 	if err != nil {
@@ -392,10 +479,6 @@ func (c *CLI) env(args []string) error {
 	}
 	normalizeConfig(&cfg)
 
-	if b, err := os.ReadFile(filepath.Join(cfg.StateDir, "env")); err == nil {
-		_, _ = c.out.Write(b)
-		return nil
-	}
 	st, err := loadState(cfg.StateDir)
 	if err != nil {
 		return err
@@ -539,21 +622,64 @@ func installContainerAssets(stateDir string, dryRun bool) error {
 	return os.WriteFile(target, data, 0o755)
 }
 
-func writeGuestConfig(cfg Config, dryRun bool) error {
+func writeGuestConfig(cfg Config, fsid string, hostNetwork bool, dryRun bool) error {
 	if dryRun {
 		return nil
 	}
-	fsid := randomUUIDLike()
+	rgwBindAddr := "0.0.0.0"
+	rgwBindPort := 7480
+	if hostNetwork {
+		rgwBindAddr = "127.0.0.1"
+		rgwBindPort = cfg.RGWPort
+	}
+	hostNet := 0
+	if hostNetwork {
+		hostNet = 1
+	}
 	env := fmt.Sprintf(`FSID=%s
 OSD_ID=0
 OSD_DEVICE=/dev/cephplay-osd0
 OSD_MEMORY_TARGET=%d
 RGW_PORT=%d
+RGW_BIND_ADDR=%s
+RGW_BIND_PORT=%d
+HOST_NETWORK=%d
+SERVICES=%s
+CEPHFS_NAME=%s
+CEPHFS_CLIENT=%s
+CEPHFS_KEYRING_FILE=%s
+RBD_POOL=%s
+RBD_IMAGE=%s
+RBD_CLIENT=%s
+RBD_KEYRING_FILE=%s
+CEPH_CONF_FILE=%s
+ADMIN_KEYRING_FILE=%s
 S3_REGION=%s
 S3_UID=%s
 AWS_ACCESS_KEY_ID=%s
 AWS_SECRET_ACCESS_KEY=%s
-`, shellPlain(fsid), cfg.OSDMemoryTarget, cfg.RGWPort, shellQuote(cfg.Region), shellQuote(cfg.S3UID), shellQuote(cfg.AccessKey), shellQuote(cfg.SecretKey))
+`,
+		shellPlain(fsid),
+		cfg.OSDMemoryTarget,
+		cfg.RGWPort,
+		rgwBindAddr,
+		rgwBindPort,
+		hostNet,
+		shellQuote(strings.Join(cfg.Services, ",")),
+		shellQuote(cephFSName),
+		shellQuote(cephFSClientName),
+		shellQuote(cephFSKeyringFile),
+		shellQuote(rbdPoolName),
+		shellQuote(rbdSampleImage),
+		shellQuote(rbdClientName),
+		shellQuote(rbdKeyringFile),
+		shellQuote(cephConfFile),
+		shellQuote(adminKeyringFile),
+		shellQuote(cfg.Region),
+		shellQuote(cfg.S3UID),
+		shellQuote(cfg.AccessKey),
+		shellQuote(cfg.SecretKey),
+	)
 	return os.WriteFile(filepath.Join(cfg.StateDir, "config.env"), []byte(env), 0o600)
 }
 
@@ -595,21 +721,65 @@ func runContainer(ctx context.Context, r *Runner, cfg Config, loop string) error
 		"--name", cfg.ContainerName,
 		"--hostname", cfg.ContainerName,
 		"--stop-timeout", "30",
-		"-p", fmt.Sprintf("127.0.0.1:%d:7480", cfg.RGWPort),
-		"--device", loop + ":/dev/cephplay-osd0",
+	}
+	if needsHostNetwork(cfg.Services) {
+		args = append(args, "--network", "host")
+	} else if containsService(cfg.Services, serviceRGW) {
+		args = append(args, "-p", fmt.Sprintf("127.0.0.1:%d:7480", cfg.RGWPort))
+	}
+	args = append(args,
+		"--device", loop+":/dev/cephplay-osd0",
 		"--cap-add", "SYS_ADMIN",
 		"--tmpfs", "/etc/ceph:rw,size=64m,mode=755",
 		"--tmpfs", "/run/ceph:rw,size=64m,mode=755",
 		"--tmpfs", "/var/lib/ceph:rw,size=2g,mode=755",
 		"--tmpfs", "/var/log/ceph:rw,size=256m,mode=755",
 		"--tmpfs", "/tmp:rw,size=1g,mode=1777",
-		"-v", cfg.StateDir + ":/cephplay",
-	}
+		"-v", cfg.StateDir+":/cephplay",
+	)
 	if cfg.Privileged {
 		args = append(args, "--privileged")
 	}
 	args = append(args, cfg.Image, "/cephplay/container-entrypoint.sh")
 	return r.Run(ctx, cfg.Runtime, args...)
+}
+
+func needsHostNetwork(services []string) bool {
+	return containsService(services, serviceCephFS) || containsService(services, serviceRBD)
+}
+
+func containsService(services []string, name string) bool {
+	for _, s := range services {
+		if s == name {
+			return true
+		}
+	}
+	return false
+}
+
+func parseServices(raw string) ([]string, error) {
+	parts := strings.Split(raw, ",")
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range parts {
+		s := strings.ToLower(strings.TrimSpace(p))
+		if s == "" {
+			continue
+		}
+		switch s {
+		case serviceRGW, serviceCephFS, serviceRBD:
+		default:
+			return nil, fmt.Errorf("unknown service %q (allowed: rgw, cephfs, rbd)", s)
+		}
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	if len(out) == 0 {
+		return nil, errors.New("--services must list at least one of rgw, cephfs, rbd")
+	}
+	return out, nil
 }
 
 func loopDevicesFor(ctx context.Context, r *Runner, image string) ([]string, error) {
@@ -645,13 +815,40 @@ func saveState(dir string, st State, dryRun bool) error {
 }
 
 func printEnv(out io.Writer, st State) {
-	fmt.Fprintf(out, "export AWS_ACCESS_KEY_ID=%s\n", shellQuote(st.AccessKey))
-	fmt.Fprintf(out, "export AWS_SECRET_ACCESS_KEY=%s\n", shellQuote(st.SecretKey))
-	fmt.Fprintf(out, "export AWS_REGION=%s\n", shellQuote(st.Region))
-	fmt.Fprintf(out, "export AWS_DEFAULT_REGION=%s\n", shellQuote(st.Region))
-	fmt.Fprintf(out, "export AWS_ENDPOINT_URL=%s\n", shellQuote(st.Endpoint))
-	fmt.Fprintf(out, "export CEPHPLAY_ENDPOINT=%s\n", shellQuote(st.Endpoint))
-	fmt.Fprintf(out, "export CEPHPLAY_REGION=%s\n", shellQuote(st.Region))
+	if st.HasService(serviceRGW) {
+		fmt.Fprintf(out, "# RGW (S3); drop-in for AWS SDKs\n")
+		fmt.Fprintf(out, "export AWS_ACCESS_KEY_ID=%s\n", shellQuote(st.AccessKey))
+		fmt.Fprintf(out, "export AWS_SECRET_ACCESS_KEY=%s\n", shellQuote(st.SecretKey))
+		fmt.Fprintf(out, "export AWS_REGION=%s\n", shellQuote(st.Region))
+		fmt.Fprintf(out, "export AWS_DEFAULT_REGION=%s\n", shellQuote(st.Region))
+		fmt.Fprintf(out, "export AWS_ENDPOINT_URL=%s\n", shellQuote(st.Endpoint))
+		fmt.Fprintf(out, "export CEPHPLAY_ENDPOINT=%s\n", shellQuote(st.Endpoint))
+		fmt.Fprintf(out, "export CEPHPLAY_REGION=%s\n", shellQuote(st.Region))
+	}
+	if st.HasService(serviceCephFS) || st.HasService(serviceRBD) {
+		fmt.Fprintf(out, "\n# Ceph cluster; point ceph-common at these\n")
+		fmt.Fprintf(out, "export CEPH_CONF=%s\n", shellQuote(st.CephConf))
+		fmt.Fprintf(out, "export CEPHPLAY_FSID=%s\n", shellQuote(st.FSID))
+		fmt.Fprintf(out, "export CEPHPLAY_MON_HOST=%s\n", shellQuote(st.MonHost))
+		fmt.Fprintf(out, "export CEPHPLAY_ADMIN_KEYRING=%s\n", shellQuote(st.AdminKeyring))
+	}
+	if st.HasService(serviceCephFS) {
+		fmt.Fprintf(out, "\n# CephFS; mount with ceph-fuse or mount.ceph\n")
+		fmt.Fprintf(out, "export CEPHPLAY_CEPHFS_NAME=%s\n", shellQuote(st.CephFSName))
+		fmt.Fprintf(out, "export CEPHPLAY_CEPHFS_CLIENT=%s\n", shellQuote(st.CephFSClient))
+		fmt.Fprintf(out, "export CEPHPLAY_CEPHFS_KEYRING=%s\n", shellQuote(st.CephFSKeyring))
+		fmt.Fprintf(out, "# example:\n")
+		fmt.Fprintf(out, "#   sudo ceph-fuse --id %s --conf %s -k %s -r / /mnt/playfs\n", st.CephFSClient, st.CephConf, st.CephFSKeyring)
+	}
+	if st.HasService(serviceRBD) {
+		fmt.Fprintf(out, "\n# RBD; map with rbd-nbd or rbd map\n")
+		fmt.Fprintf(out, "export CEPHPLAY_RBD_POOL=%s\n", shellQuote(st.RBDPool))
+		fmt.Fprintf(out, "export CEPHPLAY_RBD_IMAGE=%s\n", shellQuote(st.RBDImage))
+		fmt.Fprintf(out, "export CEPHPLAY_RBD_CLIENT=%s\n", shellQuote(st.RBDClient))
+		fmt.Fprintf(out, "export CEPHPLAY_RBD_KEYRING=%s\n", shellQuote(st.RBDKeyring))
+		fmt.Fprintf(out, "# example:\n")
+		fmt.Fprintf(out, "#   sudo rbd-nbd map --id %s --conf %s -k %s %s/%s\n", st.RBDClient, st.CephConf, st.RBDKeyring, st.RBDPool, st.RBDImage)
+	}
 }
 
 func loadState(dir string) (State, error) {
@@ -673,6 +870,9 @@ func waitForReady(ctx context.Context, readyPath, endpoint string) error {
 
 	for {
 		if exists(readyPath) {
+			if endpoint == "" {
+				return nil
+			}
 			resp, err := client.Get(endpoint)
 			if err == nil {
 				_ = resp.Body.Close()
@@ -682,7 +882,7 @@ func waitForReady(ctx context.Context, readyPath, endpoint string) error {
 
 		select {
 		case <-ctx.Done():
-			return errors.New("timed out waiting for RGW")
+			return errors.New("timed out waiting for cluster")
 		case <-tick.C:
 		}
 	}

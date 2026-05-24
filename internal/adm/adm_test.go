@@ -49,6 +49,35 @@ func TestNormalizeConfigNameUpdatesDefaultStateDir(t *testing.T) {
 	}
 }
 
+func TestParseServices(t *testing.T) {
+	got, err := parseServices(" RGW, cephfs ,rbd,rgw ")
+	if err != nil {
+		t.Fatalf("parseServices: %v", err)
+	}
+	want := []string{"rgw", "cephfs", "rbd"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseServices = %#v, want %#v", got, want)
+	}
+	if _, err := parseServices(""); err == nil {
+		t.Fatalf("empty services should error")
+	}
+	if _, err := parseServices("rgw,nfs"); err == nil {
+		t.Fatalf("unknown service should error")
+	}
+}
+
+func TestNeedsHostNetwork(t *testing.T) {
+	if needsHostNetwork([]string{"rgw"}) {
+		t.Fatalf("rgw-only should not need host network")
+	}
+	if !needsHostNetwork([]string{"rgw", "cephfs"}) {
+		t.Fatalf("cephfs should force host network")
+	}
+	if !needsHostNetwork([]string{"rbd"}) {
+		t.Fatalf("rbd should force host network")
+	}
+}
+
 func TestResetDestroyArgsKeepsOnlyDestroyFlags(t *testing.T) {
 	got := resetDestroyArgs([]string{
 		"--name", "dev",
