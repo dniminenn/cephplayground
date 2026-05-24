@@ -225,6 +225,7 @@ Tested against the `quay.io/ceph/ceph` image, all three services exercised
 
 | Release | Image tag | Status |
 | ------- | --------- | ------ |
+| Pacific  | `v16` | works, EOL upstream, not actively developed against |
 | Quincy   | `v17` | works |
 | Reef     | `v18` | works |
 | Squid    | `v19` | works (default) |
