@@ -107,7 +107,6 @@ need ceph-authtool
 need ceph-mon
 need ceph-mgr
 need ceph-osd
-need ceph-volume
 need monmaptool
 need radosgw
 need radosgw-admin
@@ -227,18 +226,25 @@ ceph config set global mon_max_pg_per_osd 1000 || true
 ceph config set global osd_memory_target "$OSD_MEMORY_TARGET" || true
 
 OSD_ID=${OSD_ID:-0}
+OSD_DIR=/var/lib/ceph/osd/ceph-${OSD_ID}
 
 log "preparing OSD on ${OSD_DEVICE}"
-if ! ceph-volume raw prepare \
-    --bluestore \
-    --data "$OSD_DEVICE" \
-    --osd-id "$OSD_ID"; then
-  log "raw prepare with explicit OSD id failed; retrying fresh-cluster prepare"
-  ceph-volume raw prepare \
-    --bluestore \
-    --data "$OSD_DEVICE"
-fi
-ceph-volume raw activate --device "$OSD_DEVICE" --no-systemd >/dev/null 2>&1 || true
+# Manual bluestore mkfs, version-agnostic. ceph-volume raw prepare is buggy on
+# Quincy (v17) with loop devices and has churned across releases; doing it by
+# hand keeps the same path working from v17 through v20+.
+OSD_FSID=$(cat /proc/sys/kernel/random/uuid)
+OSD_SECRET=$(ceph-authtool --gen-print-key)
+install -d -o ceph -g ceph -m 0755 "$OSD_DIR"
+ceph osd new "$OSD_FSID" "$OSD_ID" -i <(printf '{"cephx_secret": "%s"}\n' "$OSD_SECRET") >/dev/null
+cat >"$OSD_DIR/keyring" <<EOF_KEY
+[osd.${OSD_ID}]
+	key = ${OSD_SECRET}
+EOF_KEY
+chmod 0600 "$OSD_DIR/keyring"
+ln -sf "$OSD_DEVICE" "$OSD_DIR/block"
+chown ceph:ceph "$OSD_DEVICE"
+chown -R ceph:ceph "$OSD_DIR"
+ceph-osd --mkfs -i "$OSD_ID" --osd-uuid "$OSD_FSID" --setuser ceph --setgroup ceph
 
 log "starting OSD"
 start_daemon ceph-osd -f --cluster ceph -i "$OSD_ID" --setuser ceph --setgroup ceph

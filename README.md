@@ -35,7 +35,7 @@ direct Ceph daemons inside it:
 - `ceph-common` on the host for CephFS and RBD client tooling
 
 The default image is `quay.io/ceph/ceph:v19`. Override it with `--image` to
-test a specific Ceph release.
+test a specific Ceph release; see [Supported Ceph Versions](#supported-ceph-versions).
 
 ## Quick Start
 
@@ -218,16 +218,23 @@ The runtime state defaults to `/tmp/cephplayground/<name>`. On systems where
 Docker or Podman image layers may still live wherever the container runtime
 stores images. That is separate from playground data.
 
-## Why Not nspawn?
+## Supported Ceph Versions
 
-`systemd-nspawn` is a good tool for a local Linux appliance, but not the
-right default for a public developer tool. Docker and Podman are more common,
-work across more developer machines, and let this project avoid host-distro
-rootfs creation entirely.
+Tested against the `quay.io/ceph/ceph` image, all three services exercised
+(RGW, CephFS, RBD):
 
-`cephplayground` still avoids running `cephadm` inside a container. The
-container starts Ceph's daemons directly so there is no nested container
-runtime.
+| Release | Image tag | Status |
+| ------- | --------- | ------ |
+| Quincy   | `v17` | works |
+| Reef     | `v18` | works |
+| Squid    | `v19` | works (default) |
+| Tentacle | `v20` | works |
+
+Newer major tags should work as long as they keep `ceph-mon`, `ceph-mgr`,
+`ceph-osd`, `ceph-mds`, `radosgw`, and a `ceph` user inside the image. The
+OSD is bootstrapped with a manual bluestore `mkfs` rather than `ceph-volume`,
+so version-specific quirks in `ceph-volume raw` (notably on Quincy) do not
+matter here.
 
 ## Non-goals
 
