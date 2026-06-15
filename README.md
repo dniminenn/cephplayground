@@ -1,5 +1,7 @@
 # cephplayground
 
+**Writeup:** [A throwaway Ceph cluster in Docker and tmpfs](https://dnim.dev/blog/cephplayground)
+
 `cephplayground` runs a disposable Ceph cluster for application development.
 It exposes the three primary Ceph data services on localhost:
 
